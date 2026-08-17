@@ -1,8 +1,8 @@
+
 import os
 import time
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
@@ -29,15 +29,24 @@ def check_position():
         print(f"❌ Error al consultar balance: {e}")
         return False
 
+def calculate_rsi(prices, period=14):
+    """Calcula el RSI de forma matemática pura sin librerías externas."""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def get_market_data():
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        df['ema20'] = ta.ema(df['close'], length=20)
-        df['ema50'] = ta.ema(df['close'], length=50)
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        df['vol_ma'] = ta.sma(df['volume'], length=20)
+        # Cálculos nativos con Pandas standard
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['rsi'] = calculate_rsi(df['close'], period=14)
+        df['vol_ma'] = df['volume'].rolling(window=20).mean()
         
         return df.iloc[-1]
     except Exception as e:
