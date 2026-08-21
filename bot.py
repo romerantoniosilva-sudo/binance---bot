@@ -1,4 +1,3 @@
-s
 import time
 import math
 import os
