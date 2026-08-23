@@ -600,23 +600,19 @@ def ejecutar_bot():
             f"{precio_referencia:.2f}"
         )
 
-        # ------------------------------
-        # 4. Niveles ocupados
-        # ------------------------------
-        niveles_ocupados = [
-            i + 1
-            for i, activo
-            in niveles_activos.items()
-            if activo
-        ]
+    # ------------------------------
+# 4. Niveles ocupados
+# ------------------------------
+niveles_ocupados = [
+    i + 1
+    for i, activo in niveles_activos.items()
+    if activo
+]
 
-        print(
-            "📊 Operaciones activas: "
-            f"{niveles_ocupados "
-            if niveles_ocupados "
-            else 'ninguna'}"
-        )
-
+print(
+    "📊 Operaciones activas: "
+    f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+)
         # ------------------------------
         # 5. Buscar compra
         # ------------------------------
