@@ -1,7 +1,6 @@
 ccxt==4.2.1
 pandas==1.5.3
 numpy==1.23.5
-ccxt
 requests
 fastapi
 uvicorn
