@@ -597,44 +597,36 @@ def ejecutar_bot():
             f"🔍 BTC: "
             f"{precio_actual:.2f} | "
             f"Referencia: "
-            f"{precio_referencia:.2f}"
-        )
-
-    # ------------------------------
-# 4. Niveles ocupados
-# ------------------------------
-niveles_ocupados = [
-    i + 1
-    for i, activo in niveles_activos.items()
-    if activo
-]
-
-print(
-    "📊 Operaciones activas: "
-    f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
-)
-        # ------------------------------
-        # 5. Buscar compra
-        # ------------------------------
-        compra_realizada = False
-
-        for i, caida in enumerate(
-            PORCENTAJES_CAIDA
-        ):
-
-            if niveles_activos[i]:
-                continue
-
-            precio_objetivo = (
-                precio_referencia
-                * (1 + caida)
+         * (1 + caida)
             )
 
             print(
                 f"Nivel {i + 1}: "
                 f"{precio_objetivo:.2f}"
             )
+        # ------------------------------
+        # 4. Niveles ocupados
+        # ------------------------------
+        niveles_ocupados = [
+            i + 1
+            for i, activo in niveles_activos.items()
+            if activo
+        ]
 
+        print(
+            "📊 Operaciones activas: "
+            f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+        )
+
+        # ------------------------------
+        # 5. Buscar compra
+        # ------------------------------
+        compra_realizada = False
+
+        for i, caida in enumerate(PORCENTAJES_CAIDA):
+
+            if niveles_activos[i]:
+                continue
             if (
                 precio_actual
                 <= precio_objetivo
