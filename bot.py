@@ -624,20 +624,17 @@ def ejecutar_bot():
 
         # ------------------------------
         # 5. Niveles ocupados
-        # ------------------------------
-        niveles_ocupados = [
-            i + 1
-            for i, activo
-            in niveles_activos.items()
-            if activo
-        ]
+# ------------------------------
+niveles_ocupados = [
+    i + 1
+    for i, activo in niveles_activos.items()
+    if activo
+]
 
-        print(
-            "📊 Operaciones activas: "
-            "{niveles_ocupados "
-            if niveles_ocupados "
-            else 'ninguna'}"
-        )
+print(
+    "📊 Operaciones activas: "
+    f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+)
 
         # ------------------------------
         # 6. Buscar compra
