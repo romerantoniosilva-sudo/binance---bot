@@ -5,10 +5,12 @@ import requests
 import ccxt
 from fastapi import FastAPI
 
+
 # ==========================================
 # 🌐 SERVIDOR WEB PARA RENDER
 # ==========================================
 app = FastAPI()
+
 
 # ==========================================
 # 🔒 VARIABLES DE ENTORNO
@@ -17,6 +19,7 @@ BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
 
 # ==========================================
 # ⚙️ CONFIGURACIÓN DEL BOT
@@ -39,10 +42,10 @@ PORCENTAJES_CAIDA = [
 
 TAKE_PROFIT_PORCENTAJE = 0.06
 
-# Revisar cada 5 minutos.
+# Revisar cada 5 minutos
 INTERVALO_REVISION_SEGUNDOS = 300
 
-# Tiempo de espera si Binance devuelve 418/429.
+# Tiempo de espera ante errores 418/429
 ESPERA_ERROR_BINANCE = 900
 
 
@@ -65,7 +68,8 @@ exchange = ccxt.binance({
 precio_referencia = None
 
 niveles_activos = {
-    i: False for i in range(MAX_OPERACIONES)
+    i: False
+    for i in range(MAX_OPERACIONES)
 }
 
 ordenes_tp = {}
@@ -114,6 +118,7 @@ def enviar_telegram(mensaje):
         )
 
         if not respuesta.ok:
+
             print(
                 f"❌ Error Telegram: "
                 f"{respuesta.text}"
@@ -140,8 +145,6 @@ def manejar_error_binance(error):
         f"{mensaje}"
     )
 
-    # 418 = IP temporalmente bloqueada
-    # 429 = demasiadas solicitudes
     if (
         "418" in mensaje
         or "429" in mensaje
@@ -150,7 +153,6 @@ def manejar_error_binance(error):
 
         ahora = time.time()
 
-        # Evitar enviar múltiples alertas.
         if (
             ahora - ultimo_error_binance
             > ESPERA_ERROR_BINANCE
@@ -190,7 +192,6 @@ def obtener_saldo_usdt():
     except Exception as e:
 
         manejar_error_binance(e)
-
         raise
 
 
@@ -206,6 +207,7 @@ def obtener_precio_actual():
         precio = ticker.get("last")
 
         if precio is None:
+
             raise Exception(
                 "Binance no devolvió precio."
             )
@@ -215,7 +217,6 @@ def obtener_precio_actual():
     except Exception as e:
 
         manejar_error_binance(e)
-
         raise
 
 
@@ -295,9 +296,7 @@ def sincronizar_estado():
                 or ""
             )
 
-            if client_id.startswith(
-                "BOT_TP_"
-            ):
+            if client_id.startswith("BOT_TP_"):
 
                 partes = client_id.split("_")
 
@@ -323,6 +322,7 @@ def sincronizar_estado():
                             ] = orden["id"]
 
                     except ValueError:
+
                         pass
 
         niveles_activos = nuevos_niveles
@@ -583,7 +583,8 @@ def ejecutar_bot():
 
             print(
                 mensaje.replace(
-                    "*", ""
+                    "*",
+                    ""
                 )
             )
 
@@ -593,40 +594,68 @@ def ejecutar_bot():
 
             return
 
+        # ------------------------------
+        # Mostrar precio actual
+        # ------------------------------
         print(
             f"🔍 BTC: "
             f"{precio_actual:.2f} | "
             f"Referencia: "
-         * (1 + caida)
+            f"{precio_referencia:.2f}"
+        )
+
+        # ------------------------------
+        # 4. Mostrar niveles
+        # ------------------------------
+        for i, caida in enumerate(
+            PORCENTAJES_CAIDA
+        ):
+
+            precio_objetivo = (
+                precio_referencia
+                * (1 + caida)
             )
 
             print(
                 f"Nivel {i + 1}: "
-                f"{precio_objetivo:.2f}"
+                f"{precio_objetivo:.2f} "
+                f"USDT"
             )
+
         # ------------------------------
-        # 4. Niveles ocupados
+        # 5. Niveles ocupados
         # ------------------------------
         niveles_ocupados = [
             i + 1
-            for i, activo in niveles_activos.items()
+            for i, activo
+            in niveles_activos.items()
             if activo
         ]
 
         print(
             "📊 Operaciones activas: "
-            f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+            f"{niveles_ocupados "
+            if niveles_ocupados "
+            else 'ninguna'}"
         )
 
         # ------------------------------
-        # 5. Buscar compra
+        # 6. Buscar compra
         # ------------------------------
         compra_realizada = False
 
-        for i, caida in enumerate(PORCENTAJES_CAIDA):
+        for i, caida in enumerate(
+            PORCENTAJES_CAIDA
+        ):
 
             if niveles_activos[i]:
                 continue
+
+            precio_objetivo = (
+                precio_referencia
+                * (1 + caida)
+            )
+
             if (
                 precio_actual
                 <= precio_objetivo
@@ -645,21 +674,23 @@ def ejecutar_bot():
                     break
 
         # ------------------------------
-        # 6. Nuevo ciclo alcista
+        # 7. Nuevo ciclo alcista
         # ------------------------------
         if not any(
             niveles_activos.values()
         ):
 
+            precio_nuevo_ciclo = (
+                precio_referencia
+                * (
+                    1
+                    + TAKE_PROFIT_PORCENTAJE
+                )
+            )
+
             if (
                 precio_actual
-                >= (
-                    precio_referencia
-                    * (
-                        1
-                        + TAKE_PROFIT_PORCENTAJE
-                    )
-                )
+                >= precio_nuevo_ciclo
             ):
 
                 precio_anterior = (
