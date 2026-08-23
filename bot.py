@@ -634,7 +634,7 @@ def ejecutar_bot():
 
         print(
             "📊 Operaciones activas: "
-            f"{niveles_ocupados "
+            "{niveles_ocupados "
             if niveles_ocupados "
             else 'ninguna'}"
         )
