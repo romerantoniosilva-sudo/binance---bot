@@ -623,7 +623,6 @@ def ejecutar_bot():
             )
 
         # ------------------------------
-            # ------------------------------
         # 5. Niveles ocupados
         # ------------------------------
         niveles_ocupados = [
@@ -714,7 +713,6 @@ def ejecutar_bot():
         )
 
         manejar_error_binance(e)
-
 
 # ==========================================
 # 🔁 BUCLE PRINCIPAL
