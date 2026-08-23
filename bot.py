@@ -2,11 +2,11 @@ import time
 import os
 import threading
 import requests
-from ccxt import binance
+import ccxt
 from fastapi import FastAPI
 
 # ==========================================
-# 🌐 CONFIGURACIÓN DEL SERVIDOR WEB
+# 🌐 SERVIDOR WEB PARA RENDER
 # ==========================================
 app = FastAPI()
 
@@ -19,7 +19,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # ==========================================
-# ⚙️ CONFIGURACIÓN
+# ⚙️ CONFIGURACIÓN DEL BOT
 # ==========================================
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
@@ -28,15 +28,28 @@ MONTO_POR_COMPRA_USDT = 10.0
 MAX_OPERACIONES = 6
 RESERVA_USDT = 4.0
 
-PORCENTAJES_CAIDA = [-0.02, -0.04, -0.06, -0.09, -0.12, -0.15]
+PORCENTAJES_CAIDA = [
+    -0.02,
+    -0.04,
+    -0.06,
+    -0.09,
+    -0.12,
+    -0.15
+]
+
 TAKE_PROFIT_PORCENTAJE = 0.06
 
+# Revisar cada 5 minutos.
 INTERVALO_REVISION_SEGUNDOS = 300
 
+# Tiempo de espera si Binance devuelve 418/429.
+ESPERA_ERROR_BINANCE = 900
+
+
 # ==========================================
-# 🔌 CONEXIÓN BINANCE
+# 🔌 CONEXIÓN BINANCE SPOT
 # ==========================================
-exchange = binance({
+exchange = ccxt.binance({
     "apiKey": BINANCE_API_KEY,
     "secret": BINANCE_SECRET_KEY,
     "enableRateLimit": True,
@@ -45,24 +58,23 @@ exchange = binance({
     }
 })
 
-exchange.load_markets()
 
 # ==========================================
 # 📊 ESTADO DEL BOT
 # ==========================================
 precio_referencia = None
 
-# Cada nivel representa una operación activa.
-# True = hay una compra con TP pendiente.
 niveles_activos = {
     i: False for i in range(MAX_OPERACIONES)
 }
 
-# Órdenes TP creadas por el bot.
 ordenes_tp = {}
 
+ultimo_error_binance = 0
+
+
 # ==========================================
-# 🌐 SERVIDOR RENDER
+# 🌐 HEALTH CHECK
 # ==========================================
 @app.get("/")
 def home():
@@ -78,11 +90,15 @@ def home():
 # 📢 TELEGRAM
 # ==========================================
 def enviar_telegram(mensaje):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no está configurado.")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -90,6 +106,7 @@ def enviar_telegram(mensaje):
     }
 
     try:
+
         respuesta = requests.post(
             url,
             json=payload,
@@ -97,63 +114,156 @@ def enviar_telegram(mensaje):
         )
 
         if not respuesta.ok:
-            print(f"❌ Error Telegram: {respuesta.text}")
+            print(
+                f"❌ Error Telegram: "
+                f"{respuesta.text}"
+            )
 
     except Exception as e:
-        print(f"❌ Error enviando Telegram: {e}")
+
+        print(
+            f"❌ Error enviando Telegram: {e}"
+        )
+
+
+# ==========================================
+# 🛡️ MANEJO DE ERRORES BINANCE
+# ==========================================
+def manejar_error_binance(error):
+
+    global ultimo_error_binance
+
+    mensaje = str(error)
+
+    print(
+        f"⚠️ Binance rechazó la solicitud: "
+        f"{mensaje}"
+    )
+
+    # 418 = IP temporalmente bloqueada
+    # 429 = demasiadas solicitudes
+    if (
+        "418" in mensaje
+        or "429" in mensaje
+        or "DDoSProtection" in mensaje
+    ):
+
+        ahora = time.time()
+
+        # Evitar enviar múltiples alertas.
+        if (
+            ahora - ultimo_error_binance
+            > ESPERA_ERROR_BINANCE
+        ):
+
+            ultimo_error_binance = ahora
+
+            enviar_telegram(
+                "🚨 *BINANCE LIMITÓ LAS SOLICITUDES*\n\n"
+                "El bot entrará en espera para "
+                "evitar aumentar el bloqueo.\n\n"
+                f"Error: `{mensaje[:300]}`"
+            )
+
+        return True
+
+    return False
 
 
 # ==========================================
 # 💰 SALDO USDT
 # ==========================================
 def obtener_saldo_usdt():
-    balance = exchange.fetch_balance()
 
-    saldo_libre = balance["free"].get("USDT", 0)
+    try:
 
-    return float(saldo_libre)
+        balance = exchange.fetch_balance()
+
+        saldo_libre = (
+            balance
+            .get("free", {})
+            .get("USDT", 0)
+        )
+
+        return float(saldo_libre)
+
+    except Exception as e:
+
+        manejar_error_binance(e)
+
+        raise
 
 
 # ==========================================
 # ₿ PRECIO BTC
 # ==========================================
 def obtener_precio_actual():
-    ticker = exchange.fetch_ticker(SYMBOL)
 
-    return float(ticker["last"])
+    try:
+
+        ticker = exchange.fetch_ticker(SYMBOL)
+
+        precio = ticker.get("last")
+
+        if precio is None:
+            raise Exception(
+                "Binance no devolvió precio."
+            )
+
+        return float(precio)
+
+    except Exception as e:
+
+        manejar_error_binance(e)
+
+        raise
 
 
 # ==========================================
 # 🔢 PRECISIÓN DE CANTIDAD
 # ==========================================
 def ajustar_precision_cantidad(cantidad):
+
     try:
-        cantidad_ajustada = exchange.amount_to_precision(
-            SYMBOL,
-            cantidad
+
+        cantidad_ajustada = (
+            exchange.amount_to_precision(
+                SYMBOL,
+                cantidad
+            )
         )
 
         return float(cantidad_ajustada)
 
     except Exception as e:
-        print(f"❌ Error ajustando cantidad: {e}")
+
+        print(
+            f"❌ Error ajustando cantidad: {e}"
+        )
+
         return 0.0
 
 
 # ==========================================
-# 📋 OBTENER ÓRDENES ABIERTAS
+# 📋 ÓRDENES ABIERTAS
 # ==========================================
 def obtener_ordenes_abiertas():
+
     try:
-        return exchange.fetch_open_orders(SYMBOL)
+
+        return exchange.fetch_open_orders(
+            SYMBOL
+        )
 
     except Exception as e:
-        print(f"❌ Error consultando órdenes abiertas: {e}")
+
+        manejar_error_binance(e)
+
         return []
 
 
 # ==========================================
-# 🔄 SINCRONIZAR ESTADO CON BINANCE
+# 🔄 SINCRONIZAR ESTADO
 # ==========================================
 def sincronizar_estado():
 
@@ -162,10 +272,13 @@ def sincronizar_estado():
 
     try:
 
-        ordenes_abiertas = obtener_ordenes_abiertas()
+        ordenes_abiertas = (
+            obtener_ordenes_abiertas()
+        )
 
         nuevos_niveles = {
-            i: False for i in range(MAX_OPERACIONES)
+            i: False
+            for i in range(MAX_OPERACIONES)
         }
 
         nuevas_ordenes = {}
@@ -177,25 +290,37 @@ def sincronizar_estado():
 
             client_id = (
                 orden.get("clientOrderId")
-                or orden.get("info", {}).get("clientOrderId")
+                or orden.get("info", {})
+                .get("clientOrderId")
                 or ""
             )
 
-            # Nuestro formato:
-            # BOT_TP_NIVEL_TIMESTAMP
-            if client_id.startswith("BOT_TP_"):
+            if client_id.startswith(
+                "BOT_TP_"
+            ):
 
                 partes = client_id.split("_")
 
                 if len(partes) >= 3:
 
                     try:
-                        nivel = int(partes[2])
 
-                        if 0 <= nivel < MAX_OPERACIONES:
+                        nivel = int(
+                            partes[2]
+                        )
 
-                            nuevos_niveles[nivel] = True
-                            nuevas_ordenes[nivel] = orden["id"]
+                        if (
+                            0 <= nivel
+                            < MAX_OPERACIONES
+                        ):
+
+                            nuevos_niveles[
+                                nivel
+                            ] = True
+
+                            nuevas_ordenes[
+                                nivel
+                            ] = orden["id"]
 
                     except ValueError:
                         pass
@@ -205,62 +330,90 @@ def sincronizar_estado():
 
     except Exception as e:
 
-        print(f"❌ Error sincronizando estado: {e}")
+        print(
+            f"❌ Error sincronizando estado: "
+            f"{e}"
+        )
 
 
 # ==========================================
 # 🛒 EJECUTAR COMPRA
 # ==========================================
-def ejecutar_compra(nivel, precio_actual):
+def ejecutar_compra(
+    nivel,
+    precio_actual
+):
 
     global niveles_activos
     global ordenes_tp
 
     try:
 
+        # ------------------------------
+        # Verificar saldo
+        # ------------------------------
         saldo_usdt = obtener_saldo_usdt()
 
-        # Nunca utilizar la reserva de USDT.
-        saldo_disponible_para_comprar = (
-            saldo_usdt - RESERVA_USDT
+        saldo_disponible = (
+            saldo_usdt
+            - RESERVA_USDT
         )
 
-        if saldo_disponible_para_comprar < MONTO_POR_COMPRA_USDT:
+        if (
+            saldo_disponible
+            < MONTO_POR_COMPRA_USDT
+        ):
 
             enviar_telegram(
                 "⚠️ *Compra cancelada*\n"
-                f"Saldo USDT: `{saldo_usdt:.2f}`\n"
-                f"Reserva mínima: `{RESERVA_USDT:.2f}`"
+                f"Saldo USDT: "
+                f"`{saldo_usdt:.2f}`\n"
+                f"Reserva: "
+                f"`{RESERVA_USDT:.2f}`"
             )
 
             return False
 
-        # Calculamos BTC equivalente a 10 USDT.
+        # ------------------------------
+        # Cantidad BTC
+        # ------------------------------
         cantidad_btc = (
-            MONTO_POR_COMPRA_USDT / precio_actual
+            MONTO_POR_COMPRA_USDT
+            / precio_actual
         )
 
-        cantidad_ajustada = ajustar_precision_cantidad(
-            cantidad_btc
+        cantidad_ajustada = (
+            ajustar_precision_cantidad(
+                cantidad_btc
+            )
         )
 
         if cantidad_ajustada <= 0:
-            print("❌ Cantidad BTC inválida.")
+
+            print(
+                "❌ Cantidad BTC inválida."
+            )
+
             return False
 
         enviar_telegram(
             f"⚠️ *Nivel {nivel + 1} alcanzado*\n"
-            f"Caída: `{PORCENTAJES_CAIDA[nivel] * 100:.0f}%`\n"
-            f"Precio: `{precio_actual:.2f} USDT`\n"
-            f"💰 Ejecutando compra de `{MONTO_POR_COMPRA_USDT:.2f} USDT`..."
+            f"Caída: "
+            f"`{PORCENTAJES_CAIDA[nivel] * 100:.0f}%`\n"
+            f"Precio: "
+            f"`{precio_actual:.2f} USDT`\n"
+            f"💰 Compra: "
+            f"`{MONTO_POR_COMPRA_USDT:.2f} USDT`"
         )
 
-        # ==========================================
-        # 🛒 COMPRA DE MERCADO
-        # ==========================================
-        orden_compra = exchange.create_market_buy_order(
-            SYMBOL,
-            cantidad_ajustada
+        # ------------------------------
+        # COMPRA MARKET
+        # ------------------------------
+        orden_compra = (
+            exchange.create_market_buy_order(
+                SYMBOL,
+                cantidad_ajustada
+            )
         )
 
         precio_ejecucion = (
@@ -269,7 +422,9 @@ def ejecutar_compra(nivel, precio_actual):
             or precio_actual
         )
 
-        precio_ejecucion = float(precio_ejecucion)
+        precio_ejecucion = float(
+            precio_ejecucion
+        )
 
         cantidad_real = (
             orden_compra.get("filled")
@@ -277,24 +432,32 @@ def ejecutar_compra(nivel, precio_actual):
             or cantidad_ajustada
         )
 
-        cantidad_real = float(cantidad_real)
-
-        # Ajustamos nuevamente para Binance.
-        cantidad_real = ajustar_precision_cantidad(
+        cantidad_real = float(
             cantidad_real
         )
 
+        cantidad_real = (
+            ajustar_precision_cantidad(
+                cantidad_real
+            )
+        )
+
         if cantidad_real <= 0:
+
             raise Exception(
-                "Binance no devolvió una cantidad válida."
+                "Binance no devolvió "
+                "cantidad válida."
             )
 
-        # ==========================================
-        # 📈 TAKE PROFIT +6%
-        # ==========================================
+        # ------------------------------
+        # TAKE PROFIT +6%
+        # ------------------------------
         precio_tp = (
             precio_ejecucion
-            * (1 + TAKE_PROFIT_PORCENTAJE)
+            * (
+                1
+                + TAKE_PROFIT_PORCENTAJE
+            )
         )
 
         precio_tp = float(
@@ -304,53 +467,69 @@ def ejecutar_compra(nivel, precio_actual):
             )
         )
 
-        # Identificador único para poder reconstruir
-        # la operación si Render se reinicia.
-        timestamp = int(time.time())
+        timestamp = int(
+            time.time()
+        )
 
         client_order_id = (
             f"BOT_TP_{nivel}_{timestamp}"
         )
 
-        orden_tp = exchange.create_limit_sell_order(
-            SYMBOL,
-            cantidad_real,
-            precio_tp,
-            {
-                "newClientOrderId": client_order_id
-            }
+        # ------------------------------
+        # ORDEN LIMIT SELL
+        # ------------------------------
+        orden_tp = (
+            exchange.create_limit_sell_order(
+                SYMBOL,
+                cantidad_real,
+                precio_tp,
+                {
+                    "newClientOrderId":
+                    client_order_id
+                }
+            )
         )
 
-        # Guardamos el estado.
-        niveles_activos[nivel] = True
+        niveles_activos[
+            nivel
+        ] = True
 
-        ordenes_tp[nivel] = orden_tp["id"]
+        ordenes_tp[
+            nivel
+        ] = orden_tp["id"]
 
         enviar_telegram(
             "✅ *COMPRA EJECUTADA*\n"
             f"Nivel: `{nivel + 1}`\n"
-            f"Cantidad: `{cantidad_real:.8f} BTC`\n"
-            f"Precio compra: `{precio_ejecucion:.2f} USDT`\n"
-            f"Inversión: aproximadamente `{MONTO_POR_COMPRA_USDT:.2f} USDT`"
+            f"Cantidad: "
+            f"`{cantidad_real:.8f} BTC`\n"
+            f"Precio: "
+            f"`{precio_ejecucion:.2f} USDT`\n"
+            f"Inversión: "
+            f"`~{MONTO_POR_COMPRA_USDT:.2f} USDT`"
         )
 
         enviar_telegram(
             "🎯 *TAKE PROFIT COLOCADO*\n"
             f"Nivel: `{nivel + 1}`\n"
             f"Venta: `{precio_tp:.2f} USDT`\n"
-            f"Objetivo: `+{TAKE_PROFIT_PORCENTAJE * 100:.0f}%`"
+            f"Objetivo: `+6%`"
         )
 
         return True
 
     except Exception as e:
 
-        print(f"❌ Error ejecutando compra: {e}")
+        print(
+            f"❌ Error ejecutando compra: {e}"
+        )
+
+        manejar_error_binance(e)
 
         enviar_telegram(
-            f"❌ *Error ejecutando compra*\n"
+            "❌ *Error ejecutando compra*\n"
             f"Nivel: `{nivel + 1}`\n"
-            f"Error: `{str(e)}`"
+            f"Error: `{str(e)[:300]}`"
         )
 
         return False
@@ -365,27 +544,33 @@ def ejecutar_bot():
 
     try:
 
-        # ==========================================
-        # 1. PRECIO ACTUAL
-        # ==========================================
-        precio_actual = obtener_precio_actual()
+        # ------------------------------
+        # 1. Precio
+        # ------------------------------
+        precio_actual = (
+            obtener_precio_actual()
+        )
 
-        # ==========================================
-        # 2. SINCRONIZAR CON BINANCE
-        # ==========================================
+        # ------------------------------
+        # 2. Sincronizar órdenes
+        # ------------------------------
         sincronizar_estado()
 
-        # ==========================================
-        # 3. ESTABLECER REFERENCIA
-        # ==========================================
+        # ------------------------------
+        # 3. Referencia inicial
+        # ------------------------------
         if precio_referencia is None:
 
-            precio_referencia = precio_actual
+            precio_referencia = (
+                precio_actual
+            )
 
             mensaje = (
                 "🚀 *BOT INICIADO*\n"
-                f"BTC: `{precio_actual:.2f} USDT`\n"
-                f"Precio referencia: `{precio_referencia:.2f}`\n\n"
+                f"BTC: "
+                f"`{precio_actual:.2f} USDT`\n"
+                f"Referencia: "
+                f"`{precio_referencia:.2f}`\n\n"
                 "Niveles:\n"
                 "1️⃣ -2%\n"
                 "2️⃣ -4%\n"
@@ -396,39 +581,51 @@ def ejecutar_bot():
                 "🎯 Take Profit: +6%"
             )
 
-            print(mensaje.replace("*", ""))
+            print(
+                mensaje.replace(
+                    "*", ""
+                )
+            )
 
-            enviar_telegram(mensaje)
+            enviar_telegram(
+                mensaje
+            )
 
             return
 
         print(
-            f"🔍 BTC: {precio_actual:.2f} | "
-            f"Referencia: {precio_referencia:.2f}"
+            f"🔍 BTC: "
+            f"{precio_actual:.2f} | "
+            f"Referencia: "
+            f"{precio_referencia:.2f}"
         )
 
-        # ==========================================
-        # 4. MOSTRAR NIVELES ACTIVOS
-        # ==========================================
+        # ------------------------------
+        # 4. Niveles ocupados
+        # ------------------------------
         niveles_ocupados = [
             i + 1
-            for i, activo in niveles_activos.items()
+            for i, activo
+            in niveles_activos.items()
             if activo
         ]
 
         print(
-            f"📊 Operaciones activas: "
-            f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+            "📊 Operaciones activas: "
+            f"{niveles_ocupados "
+            if niveles_ocupados "
+            else 'ninguna'}"
         )
 
-        # ==========================================
-        # 5. BUSCAR NIVEL DE COMPRA
-        # ==========================================
+        # ------------------------------
+        # 5. Buscar compra
+        # ------------------------------
         compra_realizada = False
 
-        for i, caida in enumerate(PORCENTAJES_CAIDA):
+        for i, caida in enumerate(
+            PORCENTAJES_CAIDA
+        ):
 
-            # Este nivel ya tiene una operación abierta.
             if niveles_activos[i]:
                 continue
 
@@ -439,56 +636,67 @@ def ejecutar_bot():
 
             print(
                 f"Nivel {i + 1}: "
-                f"{precio_objetivo:.2f} USDT"
+                f"{precio_objetivo:.2f}"
             )
 
-            if precio_actual <= precio_objetivo:
+            if (
+                precio_actual
+                <= precio_objetivo
+            ):
 
-                compra_realizada = ejecutar_compra(
-                    i,
-                    precio_actual
+                compra_realizada = (
+                    ejecutar_compra(
+                        i,
+                        precio_actual
+                    )
                 )
 
-                # MUY IMPORTANTE:
-                # máximo una compra por revisión.
+                # Máximo una compra
+                # por revisión.
                 if compra_realizada:
                     break
 
-        # ==========================================
-        # 6. CICLO DE SUBIDA
-        # ==========================================
-        #
-        # Si no hay ninguna operación abierta y BTC
-        # subió al menos 6% desde la referencia,
-        # movemos la referencia hacia arriba.
-        #
-        # Esto permite que el bot siga al mercado
-        # durante tendencias alcistas.
-        #
-        if not any(niveles_activos.values()):
+        # ------------------------------
+        # 6. Nuevo ciclo alcista
+        # ------------------------------
+        if not any(
+            niveles_activos.values()
+        ):
 
-            if precio_actual >= (
-                precio_referencia
-                * (1 + TAKE_PROFIT_PORCENTAJE)
+            if (
+                precio_actual
+                >= (
+                    precio_referencia
+                    * (
+                        1
+                        + TAKE_PROFIT_PORCENTAJE
+                    )
+                )
             ):
 
-                precio_anterior = precio_referencia
+                precio_anterior = (
+                    precio_referencia
+                )
 
-                precio_referencia = precio_actual
+                precio_referencia = (
+                    precio_actual
+                )
 
                 enviar_telegram(
                     "🔄 *NUEVO CICLO*\n"
-                    f"Referencia anterior: `{precio_anterior:.2f}`\n"
-                    f"Nueva referencia: `{precio_referencia:.2f}`"
+                    f"Referencia anterior: "
+                    f"`{precio_anterior:.2f}`\n"
+                    f"Nueva referencia: "
+                    f"`{precio_referencia:.2f}`"
                 )
 
     except Exception as e:
 
-        print(f"❌ Error general: {e}")
-
-        enviar_telegram(
-            f"❌ *ERROR DEL BOT*\n`{str(e)}`"
+        print(
+            f"❌ Error general: {e}"
         )
+
+        manejar_error_binance(e)
 
 
 # ==========================================
@@ -496,37 +704,61 @@ def ejecutar_bot():
 # ==========================================
 def bucle_bot():
 
-    print("🚀 Hilo del bot de trading iniciado.")
+    print(
+        "🚀 Hilo del bot iniciado."
+    )
 
     enviar_telegram(
-        "🟢 *Bot de Binance iniciado correctamente*"
+        "🟢 *Bot de Binance iniciado*"
     )
 
     while True:
 
+        inicio = time.time()
+
         ejecutar_bot()
 
-        time.sleep(
+        duracion = (
+            time.time() - inicio
+        )
+
+        espera = max(
+            0,
             INTERVALO_REVISION_SEGUNDOS
+            - duracion
+        )
+
+        print(
+            f"⏳ Próxima revisión en "
+            f"{espera:.0f} segundos."
+        )
+
+        time.sleep(
+            espera
         )
 
 
 # ==========================================
-# 🚀 ARRANQUE EN RENDER
+# 🚀 ARRANQUE RENDER
 # ==========================================
 if __name__ == "__main__":
 
     import uvicorn
 
-    hilo_trading = threading.Thread(
-        target=bucle_bot,
-        daemon=True
+    hilo_trading = (
+        threading.Thread(
+            target=bucle_bot,
+            daemon=True
+        )
     )
 
     hilo_trading.start()
 
     puerto = int(
-        os.environ.get("PORT", 10000)
+        os.environ.get(
+            "PORT",
+            10000
+        )
     )
 
     uvicorn.run(
