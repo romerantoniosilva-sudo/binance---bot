@@ -1,9 +1,11 @@
+
 import time
 import os
 import json
 import threading
 import requests
 import ccxt
+import websocket
 
 from fastapi import FastAPI
 
@@ -45,14 +47,30 @@ PORCENTAJES_CAIDA = [
 
 TAKE_PROFIT_PORCENTAJE = 0.06
 
-# Revisar cada 5 minutos
-INTERVALO_REVISION_SEGUNDOS = 300
+# Sincronización REST cada 5 minutos.
+# El precio NO se consulta por REST.
+INTERVALO_SINCRONIZACION_SEGUNDOS = 300
 
 # Espera ante errores 418 / 429
 ESPERA_ERROR_BINANCE = 900
 
 # Archivo de estado
 ARCHIVO_ESTADO = "bot_state.json"
+
+# ==========================================
+# 🔌 WEBSOCKET BINANCE
+# ==========================================
+WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+
+# Precio recibido por WebSocket
+precio_actual_ws = None
+
+# Control del WebSocket
+ws_conectado = False
+ws_ultimo_mensaje = 0
+
+# Lock para precio
+lock_precio = threading.Lock()
 
 
 # ==========================================
@@ -99,10 +117,15 @@ lock_estado = threading.Lock()
 @app.get("/")
 def home():
 
+    with lock_precio:
+        precio_ws = precio_actual_ws
+
     return {
         "status": "ok",
         "bot": "running",
         "pair": SYMBOL,
+        "websocket": ws_conectado,
+        "last_price": precio_ws,
         "reference_price": precio_referencia,
         "active_levels": [
             i + 1
@@ -392,30 +415,22 @@ def obtener_saldo_usdt():
 
 
 # ==========================================
-# ₿ PRECIO BTC
+# ₿ PRECIO DESDE WEBSOCKET
 # ==========================================
 def obtener_precio_actual():
 
-    try:
+    with lock_precio:
 
-        ticker = exchange.fetch_ticker(
-            SYMBOL
+        precio = precio_actual_ws
+
+    if precio is None:
+
+        raise Exception(
+            "Todavía no se recibió precio "
+            "desde WebSocket."
         )
 
-        precio = ticker.get("last")
-
-        if precio is None:
-
-            raise Exception(
-                "Binance no devolvió precio."
-            )
-
-        return float(precio)
-
-    except Exception as e:
-
-        manejar_error_binance(e)
-        raise
+    return float(precio)
 
 
 # ==========================================
@@ -652,8 +667,6 @@ def sincronizar_estado():
                     MAX_OPERACIONES
                 )
             }
-
-            guardar_estado()
 
         bot_en_pausa = False
 
@@ -913,9 +926,9 @@ def ejecutar_compra(
 
 
 # ==========================================
-# 🤖 LÓGICA PRINCIPAL
+# 🤖 EVALUAR ESTRATEGIA
 # ==========================================
-def ejecutar_bot():
+def evaluar_estrategia(precio_actual):
 
     global precio_referencia
     global bot_en_pausa
@@ -935,34 +948,9 @@ def ejecutar_bot():
                 < ESPERA_ERROR_BINANCE
             ):
 
-                restante = (
-                    ESPERA_ERROR_BINANCE
-                    - (
-                        ahora
-                        - ultimo_error_binance
-                    )
-                )
-
-                print(
-                    f"⏸️ Bot en pausa. "
-                    f"Faltan {restante:.0f}s."
-                )
-
                 return
 
             bot_en_pausa = False
-
-        # ----------------------------------
-        # Precio actual
-        # ----------------------------------
-        precio_actual = (
-            obtener_precio_actual()
-        )
-
-        # ----------------------------------
-        # Sincronizar órdenes
-        # ----------------------------------
-        sincronizar_estado()
 
         # ----------------------------------
         # Referencia inicial
@@ -988,7 +976,8 @@ def ejecutar_bot():
                 "4️⃣ -9%\n"
                 "5️⃣ -12%\n"
                 "6️⃣ -15%\n\n"
-                "🎯 Take Profit: +6%"
+                "🎯 Take Profit: +6%\n"
+                "📡 Precio: WebSocket"
             )
 
             print(mensaje)
@@ -1038,16 +1027,12 @@ def ejecutar_bot():
 
         print(
             "📊 Operaciones activas: "
-            f"{niveles_ocupados "
-            if niveles_ocupados
-            else 'ninguna'}"
+            f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
         )
 
         # ----------------------------------
         # Buscar compra
         # ----------------------------------
-        compra_realizada = False
-
         for i, caida in enumerate(
             PORCENTAJES_CAIDA
         ):
@@ -1075,8 +1060,7 @@ def ejecutar_bot():
                     )
                 )
 
-                # Máximo una compra
-                # por revisión.
+                # Máximo una compra por evento
                 if compra_realizada:
                     break
 
@@ -1128,50 +1112,164 @@ def ejecutar_bot():
     except Exception as e:
 
         print(
-            f"❌ Error general: {e}"
+            f"❌ Error evaluando estrategia: {e}"
         )
 
         manejar_error_binance(e)
 
 
 # ==========================================
-# 🔁 BUCLE PRINCIPAL
+# 📡 WEBSOCKET - BINANCE
 # ==========================================
-def bucle_bot():
+def websocket_on_message(ws, message):
+
+    global precio_actual_ws
+    global ws_ultimo_mensaje
+
+    try:
+
+        data = json.loads(message)
+
+        # ----------------------------------
+        # Evento trade
+        # ----------------------------------
+        if data.get("e") != "trade":
+            return
+
+        precio = data.get("p")
+
+        if precio is None:
+            return
+
+        precio = float(precio)
+
+        with lock_precio:
+
+            precio_actual_ws = precio
+            ws_ultimo_mensaje = time.time()
+
+        # Evaluar estrategia en tiempo real
+        evaluar_estrategia(precio)
+
+    except Exception as e:
+
+        print(
+            f"❌ Error procesando WebSocket: {e}"
+        )
+
+
+def websocket_on_error(ws, error):
 
     print(
-        "🚀 Hilo del bot iniciado."
+        f"❌ WebSocket error: {error}"
     )
 
-    cargar_estado()
+
+def websocket_on_close(
+    ws,
+    close_status_code,
+    close_msg
+):
+
+    global ws_conectado
+
+    ws_conectado = False
+
+    print(
+        "⚠️ WebSocket desconectado."
+    )
+
+    print(
+        f"Código: {close_status_code} | "
+        f"Mensaje: {close_msg}"
+    )
+
+
+def websocket_on_open(ws):
+
+    global ws_conectado
+
+    ws_conectado = True
+
+    print(
+        "✅ WebSocket Binance conectado."
+    )
 
     enviar_telegram(
-        "🟢 Bot de Binance iniciado."
+        "📡 WebSocket Binance conectado.\n"
+        "Precio BTC en tiempo real."
+    )
+
+
+# ==========================================
+# 🔁 HILO WEBSOCKET
+# ==========================================
+def ejecutar_websocket():
+
+    global ws_conectado
+
+    print(
+        "📡 Hilo WebSocket iniciado."
     )
 
     while True:
 
-        inicio = time.time()
+        try:
 
-        ejecutar_bot()
+            ws_conectado = False
 
-        duracion = (
-            time.time() - inicio
-        )
+            socket = websocket.WebSocketApp(
+                WS_URL,
+                on_open=websocket_on_open,
+                on_message=websocket_on_message,
+                on_error=websocket_on_error,
+                on_close=websocket_on_close
+            )
 
-        espera = max(
-            0,
-            INTERVALO_REVISION_SEGUNDOS
-            - duracion
-        )
+            socket.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception as e:
+
+            ws_conectado = False
+
+            print(
+                f"❌ Error WebSocket: {e}"
+            )
 
         print(
-            f"⏳ Próxima revisión en "
-            f"{espera:.0f} segundos."
+            "🔄 Reconectando WebSocket "
+            "en 5 segundos..."
         )
 
+        time.sleep(5)
+
+
+# ==========================================
+# 🔄 SINCRONIZACIÓN REST
+# ==========================================
+def bucle_sincronizacion():
+
+    print(
+        "🔄 Hilo de sincronización iniciado."
+    )
+
+    while True:
+
+        try:
+
+            sincronizar_estado()
+
+        except Exception as e:
+
+            print(
+                f"❌ Error sincronización: {e}"
+            )
+
         time.sleep(
-            espera
+            INTERVALO_SINCRONIZACION_SEGUNDOS
         )
 
 
@@ -1180,14 +1278,67 @@ def bucle_bot():
 # ==========================================
 if __name__ == "__main__":
 
-    import uvicorn
+    print(
+        "🚀 Iniciando bot..."
+    )
 
-    hilo_trading = threading.Thread(
-        target=bucle_bot,
+    # --------------------------------------
+    # Cargar estado
+    # --------------------------------------
+    cargar_estado()
+
+    # --------------------------------------
+    # Cargar mercados CCXT una sola vez
+    # --------------------------------------
+    try:
+
+        exchange.load_markets()
+
+        print(
+            "✅ Mercados Binance cargados."
+        )
+
+    except Exception as e:
+
+        print(
+            f"⚠️ No se pudieron cargar "
+            f"los mercados: {e}"
+        )
+
+    # --------------------------------------
+    # Hilo WebSocket
+    # --------------------------------------
+    hilo_websocket = threading.Thread(
+        target=ejecutar_websocket,
         daemon=True
     )
 
-    hilo_trading.start()
+    hilo_websocket.start()
+
+    # --------------------------------------
+    # Hilo sincronización REST
+    # --------------------------------------
+    hilo_sincronizacion = threading.Thread(
+        target=bucle_sincronizacion,
+        daemon=True
+    )
+
+    hilo_sincronizacion.start()
+
+    # --------------------------------------
+    # Telegram
+    # --------------------------------------
+    enviar_telegram(
+        "🟢 Bot de Binance iniciado.\n"
+        "📡 WebSocket activo.\n"
+        "🎯 TP: +6%\n"
+        "💵 Compras: 6 x 10 USDT"
+    )
+
+    # --------------------------------------
+    # Render / FastAPI
+    # --------------------------------------
+    import uvicorn
 
     puerto = int(
         os.environ.get(
