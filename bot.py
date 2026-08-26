@@ -1,8 +1,11 @@
-
 import time
 import os
 import json
+import hmac
+import hashlib
 import threading
+import urllib.parse
+import uuid
 import requests
 import ccxt
 import websocket
@@ -30,7 +33,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ⚙️ CONFIGURACIÓN DEL BOT
 # ==========================================
 SYMBOL = "BTC/USDT"
-TIMEFRAME = "1h"
+BINANCE_SYMBOL = "BTCUSDT"
 
 MONTO_POR_COMPRA_USDT = 10.0
 MAX_OPERACIONES = 6
@@ -47,34 +50,24 @@ PORCENTAJES_CAIDA = [
 
 TAKE_PROFIT_PORCENTAJE = 0.06
 
-# Sincronización REST cada 5 minutos.
-# El precio NO se consulta por REST.
-INTERVALO_SINCRONIZACION_SEGUNDOS = 300
-
-# Espera ante errores 418 / 429
-ESPERA_ERROR_BINANCE = 900
-
-# Archivo de estado
 ARCHIVO_ESTADO = "bot_state.json"
 
+
 # ==========================================
-# 🔌 WEBSOCKET BINANCE
+# 🌐 WEBSOCKETS
 # ==========================================
-WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+MARKET_WS_URL = (
+    "wss://stream.binance.com:9443/ws/"
+    "btcusdt@trade"
+)
 
-# Precio recibido por WebSocket
-precio_actual_ws = None
-
-# Control del WebSocket
-ws_conectado = False
-ws_ultimo_mensaje = 0
-
-# Lock para precio
-lock_precio = threading.Lock()
+USER_WS_URL = (
+    "wss://ws-api.binance.com:443/ws-api/v3"
+)
 
 
 # ==========================================
-# 🔌 CONEXIÓN BINANCE SPOT
+# 🔌 CCXT BINANCE SPOT
 # ==========================================
 exchange = ccxt.binance({
     "apiKey": BINANCE_API_KEY,
@@ -88,27 +81,46 @@ exchange = ccxt.binance({
 
 
 # ==========================================
-# 📊 ESTADO DEL BOT
+# 📊 ESTADO
 # ==========================================
 precio_referencia = None
+precio_actual = None
 
 niveles_activos = {
     i: False
     for i in range(MAX_OPERACIONES)
 }
 
-ordenes_tp = {}
-
 niveles_completados = {
     i: False
     for i in range(MAX_OPERACIONES)
 }
 
+ordenes_tp = {}
+
+# Precio WebSocket
+ultimo_precio_ws = 0
+
+# Estado WebSocket mercado
+market_ws_conectado = False
+
+# Estado WebSocket usuario
+user_ws_conectado = False
+
+# Evita operaciones simultáneas
+operacion_en_curso = False
+
+# Protección ante 418/429
+bot_en_pausa = False
 ultimo_error_binance = 0
 
-bot_en_pausa = False
+# Control de mensajes Telegram
+ultimo_aviso_limitacion = 0
 
+# Locks
 lock_estado = threading.Lock()
+lock_precio = threading.Lock()
+lock_operacion = threading.Lock()
 
 
 # ==========================================
@@ -118,15 +130,16 @@ lock_estado = threading.Lock()
 def home():
 
     with lock_precio:
-        precio_ws = precio_actual_ws
+        precio = precio_actual
 
     return {
         "status": "ok",
         "bot": "running",
         "pair": SYMBOL,
-        "websocket": ws_conectado,
-        "last_price": precio_ws,
+        "price": precio,
         "reference_price": precio_referencia,
+        "market_websocket": market_ws_conectado,
+        "user_websocket": user_ws_conectado,
         "active_levels": [
             i + 1
             for i, activo in niveles_activos.items()
@@ -182,56 +195,59 @@ def enviar_telegram(mensaje):
     except Exception as e:
 
         print(
-            f"❌ Error enviando Telegram: {e}"
+            f"❌ Error Telegram: {e}"
         )
 
         return False
 
 
 # ==========================================
-# 🛡️ MANEJO DE ERRORES BINANCE
+# 🛡️ ERROR BINANCE
 # ==========================================
 def manejar_error_binance(error):
 
     global ultimo_error_binance
     global bot_en_pausa
+    global ultimo_aviso_limitacion
 
     mensaje = str(error)
 
     print(
-        f"⚠️ Binance rechazó la solicitud: "
-        f"{mensaje}"
+        f"⚠️ Binance: {mensaje}"
     )
 
     es_limitacion = (
         "418" in mensaje
         or "429" in mensaje
         or "DDoSProtection" in mensaje
+        or "Way too many requests" in mensaje
         or "Way too much request weight" in mensaje
     )
 
-    if es_limitacion:
+    if not es_limitacion:
+        return False
 
-        ahora = time.time()
+    ahora = time.time()
 
-        if (
-            ahora - ultimo_error_binance
-            > ESPERA_ERROR_BINANCE
-        ):
+    ultimo_error_binance = ahora
+    bot_en_pausa = True
 
-            ultimo_error_binance = ahora
-            bot_en_pausa = True
+    # No enviar Telegram repetidamente
+    if (
+        ahora - ultimo_aviso_limitacion
+        > 900
+    ):
 
-            enviar_telegram(
-                "🚨 BINANCE LIMITÓ LAS SOLICITUDES\n\n"
-                "El bot entrará temporalmente en pausa "
-                "para evitar aumentar el bloqueo.\n\n"
-                f"Error: {mensaje[:300]}"
-            )
+        ultimo_aviso_limitacion = ahora
 
-        return True
+        enviar_telegram(
+            "🚨 BINANCE LIMITÓ LAS SOLICITUDES\n\n"
+            "El bot entrará en espera para "
+            "evitar aumentar el bloqueo.\n\n"
+            f"Error: {mensaje[:400]}"
+        )
 
-    return False
+    return True
 
 
 # ==========================================
@@ -244,18 +260,18 @@ def guardar_estado():
         estado = {
             "precio_referencia": precio_referencia,
             "niveles_activos": niveles_activos,
-            "ordenes_tp": ordenes_tp,
-            "niveles_completados": niveles_completados
+            "niveles_completados": niveles_completados,
+            "ordenes_tp": ordenes_tp
         }
 
         with lock_estado:
 
-            archivo_temporal = (
+            temporal = (
                 f"{ARCHIVO_ESTADO}.tmp"
             )
 
             with open(
-                archivo_temporal,
+                temporal,
                 "w",
                 encoding="utf-8"
             ) as archivo:
@@ -267,14 +283,14 @@ def guardar_estado():
                 )
 
             os.replace(
-                archivo_temporal,
+                temporal,
                 ARCHIVO_ESTADO
             )
 
     except Exception as e:
 
         print(
-            f"⚠️ No se pudo guardar estado: {e}"
+            f"⚠️ Error guardando estado: {e}"
         )
 
 
@@ -285,16 +301,18 @@ def cargar_estado():
 
     global precio_referencia
     global niveles_activos
-    global ordenes_tp
     global niveles_completados
+    global ordenes_tp
 
-    if not os.path.exists(ARCHIVO_ESTADO):
+    if not os.path.exists(
+        ARCHIVO_ESTADO
+    ):
 
         print(
             "ℹ️ No existe estado anterior."
         )
 
-        return False
+        return
 
     try:
 
@@ -304,12 +322,12 @@ def cargar_estado():
             encoding="utf-8"
         ) as archivo:
 
-            estado = json.load(archivo)
-
-        referencia = (
-            estado.get(
-                "precio_referencia"
+            estado = json.load(
+                archivo
             )
+
+        referencia = estado.get(
+            "precio_referencia"
         )
 
         if referencia is not None:
@@ -318,77 +336,77 @@ def cargar_estado():
                 referencia
             )
 
-        niveles_guardados = (
-            estado.get(
-                "niveles_activos",
-                {}
-            )
+        guardados = estado.get(
+            "niveles_activos",
+            {}
         )
 
-        for i in range(MAX_OPERACIONES):
+        for i in range(
+            MAX_OPERACIONES
+        ):
 
             niveles_activos[i] = bool(
-                niveles_guardados.get(
+                guardados.get(
                     str(i),
-                    niveles_guardados.get(
+                    guardados.get(
                         i,
                         False
                     )
                 )
             )
 
-        ordenes_guardadas = (
-            estado.get(
-                "ordenes_tp",
-                {}
+        guardados = estado.get(
+            "niveles_completados",
+            {}
+        )
+
+        for i in range(
+            MAX_OPERACIONES
+        ):
+
+            niveles_completados[i] = bool(
+                guardados.get(
+                    str(i),
+                    guardados.get(
+                        i,
+                        False
+                    )
+                )
             )
+
+        ordenes_guardadas = estado.get(
+            "ordenes_tp",
+            {}
         )
 
         ordenes_tp.clear()
 
-        for i in range(MAX_OPERACIONES):
+        for i in range(
+            MAX_OPERACIONES
+        ):
 
             valor = ordenes_guardadas.get(
                 str(i),
-                ordenes_guardadas.get(i)
+                ordenes_guardadas.get(
+                    i
+                )
             )
 
             if valor:
 
-                ordenes_tp[i] = valor
-
-        completados_guardados = (
-            estado.get(
-                "niveles_completados",
-                {}
-            )
-        )
-
-        for i in range(MAX_OPERACIONES):
-
-            niveles_completados[i] = bool(
-                completados_guardados.get(
-                    str(i),
-                    completados_guardados.get(
-                        i,
-                        False
-                    )
+                ordenes_tp[i] = str(
+                    valor
                 )
-            )
 
         print(
             "✅ Estado anterior recuperado."
         )
-
-        return True
 
     except Exception as e:
 
         print(
             f"⚠️ Error cargando estado: {e}"
         )
-
-        return False
 
 
 # ==========================================
@@ -400,284 +418,69 @@ def obtener_saldo_usdt():
 
         balance = exchange.fetch_balance()
 
-        saldo_libre = (
+        saldo = (
             balance
             .get("free", {})
             .get("USDT", 0)
         )
 
-        return float(saldo_libre)
+        return float(saldo)
 
     except Exception as e:
 
         manejar_error_binance(e)
-        raise
+
+        return 0.0
 
 
 # ==========================================
-# ₿ PRECIO DESDE WEBSOCKET
+# 🔢 PRECISIÓN CANTIDAD
 # ==========================================
-def obtener_precio_actual():
-
-    with lock_precio:
-
-        precio = precio_actual_ws
-
-    if precio is None:
-
-        raise Exception(
-            "Todavía no se recibió precio "
-            "desde WebSocket."
-        )
-
-    return float(precio)
-
-
-# ==========================================
-# 🔢 PRECISIÓN DE CANTIDAD
-# ==========================================
-def ajustar_precision_cantidad(cantidad):
+def ajustar_precision_cantidad(
+    cantidad
+):
 
     try:
 
-        cantidad_ajustada = (
+        return float(
             exchange.amount_to_precision(
                 SYMBOL,
                 cantidad
             )
         )
 
-        return float(
-            cantidad_ajustada
-        )
-
     except Exception as e:
 
         print(
-            f"❌ Error ajustando cantidad: {e}"
+            f"❌ Error cantidad: {e}"
         )
 
         return 0.0
 
 
 # ==========================================
-# 💲 PRECISIÓN DE PRECIO
+# 💲 PRECISIÓN PRECIO
 # ==========================================
-def ajustar_precision_precio(precio):
+def ajustar_precision_precio(
+    precio
+):
 
     try:
 
-        precio_ajustado = (
+        return float(
             exchange.price_to_precision(
                 SYMBOL,
                 precio
             )
         )
 
-        return float(
-            precio_ajustado
-        )
-
     except Exception as e:
 
         print(
-            f"❌ Error ajustando precio: {e}"
+            f"❌ Error precio: {e}"
         )
 
         return 0.0
-
-
-# ==========================================
-# 📋 ÓRDENES ABIERTAS
-# ==========================================
-def obtener_ordenes_abiertas():
-
-    try:
-
-        return exchange.fetch_open_orders(
-            SYMBOL
-        )
-
-    except Exception as e:
-
-        manejar_error_binance(e)
-
-        return []
-
-
-# ==========================================
-# 🔍 BUSCAR ORDEN POR ID
-# ==========================================
-def obtener_orden_por_id(order_id):
-
-    try:
-
-        return exchange.fetch_order(
-            order_id,
-            SYMBOL
-        )
-
-    except Exception as e:
-
-        manejar_error_binance(e)
-
-        return None
-
-
-# ==========================================
-# 🔄 SINCRONIZAR ESTADO
-# ==========================================
-def sincronizar_estado():
-
-    global niveles_activos
-    global ordenes_tp
-    global niveles_completados
-    global bot_en_pausa
-
-    try:
-
-        ordenes_abiertas = (
-            obtener_ordenes_abiertas()
-        )
-
-        ids_abiertos = set()
-
-        nuevos_niveles = {
-            i: False
-            for i in range(MAX_OPERACIONES)
-        }
-
-        nuevas_ordenes = {}
-
-        # ----------------------------------
-        # Revisar órdenes TP abiertas
-        # ----------------------------------
-        for orden in ordenes_abiertas:
-
-            if orden.get("side") != "sell":
-                continue
-
-            client_id = (
-                orden.get("clientOrderId")
-                or orden.get("info", {})
-                .get("clientOrderId")
-                or ""
-            )
-
-            if not client_id.startswith(
-                "BOT_TP_"
-            ):
-
-                continue
-
-            ids_abiertos.add(
-                str(
-                    orden.get("id")
-                )
-            )
-
-            partes = client_id.split("_")
-
-            if len(partes) < 3:
-                continue
-
-            try:
-
-                nivel = int(
-                    partes[2]
-                )
-
-                if (
-                    0 <= nivel
-                    < MAX_OPERACIONES
-                ):
-
-                    nuevos_niveles[
-                        nivel
-                    ] = True
-
-                    nuevas_ordenes[
-                        nivel
-                    ] = orden["id"]
-
-            except ValueError:
-
-                continue
-
-        # ----------------------------------
-        # Detectar TPs ejecutados
-        # ----------------------------------
-        for nivel, order_id in list(
-            ordenes_tp.items()
-        ):
-
-            if (
-                str(order_id)
-                in ids_abiertos
-            ):
-
-                continue
-
-            orden = obtener_orden_por_id(
-                order_id
-            )
-
-            if not orden:
-                continue
-
-            estado = orden.get(
-                "status"
-            )
-
-            if estado == "closed":
-
-                print(
-                    f"🎯 TP ejecutado "
-                    f"nivel {nivel + 1}"
-                )
-
-                niveles_completados[
-                    nivel
-                ] = True
-
-                enviar_telegram(
-                    "💰 TAKE PROFIT EJECUTADO\n"
-                    f"Nivel: {nivel + 1}\n"
-                    "Objetivo: +6%"
-                )
-
-        niveles_activos = nuevos_niveles
-        ordenes_tp = nuevas_ordenes
-
-        # ----------------------------------
-        # Nuevo ciclo
-        # ----------------------------------
-        if (
-            not any(
-                niveles_activos.values()
-            )
-            and all(
-                niveles_completados.values()
-            )
-        ):
-
-            niveles_completados = {
-                i: False
-                for i in range(
-                    MAX_OPERACIONES
-                )
-            }
-
-        bot_en_pausa = False
-
-        guardar_estado()
-
-    except Exception as e:
-
-        print(
-            f"❌ Error sincronizando estado: "
-            f"{e}"
-        )
 
 
 # ==========================================
@@ -685,90 +488,95 @@ def sincronizar_estado():
 # ==========================================
 def ejecutar_compra(
     nivel,
-    precio_actual
+    precio
 ):
 
-    global niveles_activos
-    global ordenes_tp
+    global operacion_en_curso
+
+    with lock_operacion:
+
+        if operacion_en_curso:
+
+            print(
+                "⏳ Ya hay una operación en curso."
+            )
+
+            return False
+
+        operacion_en_curso = True
 
     try:
 
         # ----------------------------------
-        # Verificar saldo
+        # Saldo
         # ----------------------------------
-        saldo_usdt = (
-            obtener_saldo_usdt()
-        )
+        saldo = obtener_saldo_usdt()
 
-        saldo_disponible = (
-            saldo_usdt
-            - RESERVA_USDT
-        )
+        if saldo <= 0:
+
+            enviar_telegram(
+                "⚠️ No se pudo obtener "
+                "el saldo USDT."
+            )
+
+            return False
 
         if (
-            saldo_disponible
+            saldo - RESERVA_USDT
             < MONTO_POR_COMPRA_USDT
         ):
 
             enviar_telegram(
                 "⚠️ COMPRA CANCELADA\n"
-                f"Saldo USDT: "
-                f"{saldo_usdt:.2f}\n"
-                f"Reserva: "
-                f"{RESERVA_USDT:.2f}"
+                f"Saldo: {saldo:.2f} USDT\n"
+                f"Reserva: {RESERVA_USDT:.2f} USDT"
             )
 
             return False
 
         # ----------------------------------
-        # Cantidad BTC
+        # Cantidad
         # ----------------------------------
-        cantidad_btc = (
+        cantidad = (
             MONTO_POR_COMPRA_USDT
-            / precio_actual
+            / precio
         )
 
-        cantidad_ajustada = (
+        cantidad = (
             ajustar_precision_cantidad(
-                cantidad_btc
+                cantidad
             )
         )
 
-        if cantidad_ajustada <= 0:
+        if cantidad <= 0:
 
-            print(
-                "❌ Cantidad BTC inválida."
+            raise Exception(
+                "Cantidad BTC inválida."
             )
-
-            return False
 
         enviar_telegram(
             f"⚠️ NIVEL {nivel + 1} ALCANZADO\n"
             f"Caída: "
             f"{PORCENTAJES_CAIDA[nivel] * 100:.0f}%\n"
-            f"Precio: "
-            f"{precio_actual:.2f} USDT\n"
+            f"Precio: {precio:.2f} USDT\n"
             f"Compra: "
             f"{MONTO_POR_COMPRA_USDT:.2f} USDT"
         )
 
         # ----------------------------------
-        # COMPRA MARKET
+        # MARKET BUY
         # ----------------------------------
         orden_compra = (
             exchange.create_market_buy_order(
                 SYMBOL,
-                cantidad_ajustada
+                cantidad
             )
         )
 
-        # ----------------------------------
-        # Precio real de ejecución
-        # ----------------------------------
         precio_ejecucion = (
             orden_compra.get("average")
             or orden_compra.get("price")
-            or precio_actual
+            or precio
         )
 
         precio_ejecucion = float(
@@ -778,7 +586,7 @@ def ejecutar_compra(
         cantidad_real = (
             orden_compra.get("filled")
             or orden_compra.get("amount")
-            or cantidad_ajustada
+            or cantidad
         )
 
         cantidad_real = float(
@@ -794,8 +602,7 @@ def ejecutar_compra(
         if cantidad_real <= 0:
 
             raise Exception(
-                "Binance no devolvió "
-                "cantidad ejecutada válida."
+                "Cantidad ejecutada inválida."
             )
 
         # ----------------------------------
@@ -822,58 +629,42 @@ def ejecutar_compra(
             )
 
         # ----------------------------------
-        # ID ÚNICO
+        # CLIENT ORDER ID
         # ----------------------------------
-        timestamp = int(
-            time.time()
-        )
-
         client_order_id = (
-            f"BOT_TP_{nivel}_{timestamp}"
+            f"BOT_TP_{nivel}_"
+            f"{int(time.time())}_"
+            f"{uuid.uuid4().hex[:6]}"
         )
 
         # ----------------------------------
-        # ORDEN SELL LIMIT
+        # SELL LIMIT
         # ----------------------------------
-        try:
-
-            orden_tp = (
-                exchange.create_limit_sell_order(
-                    SYMBOL,
-                    cantidad_real,
-                    precio_tp,
-                    {
-                        "newClientOrderId":
-                        client_order_id
-                    }
-                )
+        orden_tp = (
+            exchange.create_limit_sell_order(
+                SYMBOL,
+                cantidad_real,
+                precio_tp,
+                {
+                    "newClientOrderId":
+                    client_order_id
+                }
             )
+        )
 
-        except Exception as error_tp:
+        order_id = orden_tp.get(
+            "id"
+        )
 
-            print(
-                "🚨 COMPRA EJECUTADA PERO "
-                "NO SE PUDO COLOCAR TP."
+        if not order_id:
+
+            raise Exception(
+                "Binance no devolvió "
+                "ID del TP."
             )
-
-            manejar_error_binance(
-                error_tp
-            )
-
-            enviar_telegram(
-                "🚨 ALERTA CRÍTICA\n\n"
-                "La compra fue ejecutada, "
-                "pero el Take Profit no pudo colocarse.\n\n"
-                f"Nivel: {nivel + 1}\n"
-                f"BTC: {cantidad_real:.8f}\n"
-                f"Entrada: "
-                f"{precio_ejecucion:.2f}"
-            )
-
-            return False
 
         # ----------------------------------
-        # Registrar operación
+        # Registrar
         # ----------------------------------
         niveles_activos[
             nivel
@@ -881,19 +672,15 @@ def ejecutar_compra(
 
         ordenes_tp[
             nivel
-        ] = orden_tp["id"]
+        ] = str(order_id)
 
         guardar_estado()
 
-        # ----------------------------------
-        # Telegram
-        # ----------------------------------
         enviar_telegram(
             "✅ COMPRA EJECUTADA\n"
             f"Nivel: {nivel + 1}\n"
-            f"Cantidad: "
-            f"{cantidad_real:.8f} BTC\n"
-            f"Precio: "
+            f"BTC: {cantidad_real:.8f}\n"
+            f"Entrada: "
             f"{precio_ejecucion:.2f} USDT\n"
             f"Inversión: "
             f"~{MONTO_POR_COMPRA_USDT:.2f} USDT"
@@ -911,7 +698,7 @@ def ejecutar_compra(
     except Exception as e:
 
         print(
-            f"❌ Error ejecutando compra: {e}"
+            f"❌ Error compra: {e}"
         )
 
         manejar_error_binance(e)
@@ -919,220 +706,165 @@ def ejecutar_compra(
         enviar_telegram(
             "❌ ERROR EJECUTANDO COMPRA\n"
             f"Nivel: {nivel + 1}\n"
-            f"Error: {str(e)[:300]}"
+            f"{str(e)[:300]}"
         )
 
         return False
 
+    finally:
+
+        with lock_operacion:
+
+            operacion_en_curso = False
+
 
 # ==========================================
-# 🤖 EVALUAR ESTRATEGIA
+# 🧠 EVALUAR ESTRATEGIA
 # ==========================================
-def evaluar_estrategia(precio_actual):
+def evaluar_estrategia(
+    precio
+):
 
     global precio_referencia
-    global bot_en_pausa
+    global precio_actual
     global niveles_completados
 
-    try:
+    precio_actual = precio
 
-        # ----------------------------------
-        # Pausa por limitación Binance
-        # ----------------------------------
-        if bot_en_pausa:
+    # --------------------------------------
+    # Pausa
+    # --------------------------------------
+    if bot_en_pausa:
 
-            ahora = time.time()
-
-            if (
-                ahora - ultimo_error_binance
-                < ESPERA_ERROR_BINANCE
-            ):
-
-                return
-
-            bot_en_pausa = False
-
-        # ----------------------------------
-        # Referencia inicial
-        # ----------------------------------
-        if precio_referencia is None:
-
-            precio_referencia = (
-                precio_actual
-            )
-
-            guardar_estado()
-
-            mensaje = (
-                "🚀 BOT INICIADO\n"
-                f"BTC: "
-                f"{precio_actual:.2f} USDT\n"
-                f"Referencia: "
-                f"{precio_referencia:.2f}\n\n"
-                "Niveles:\n"
-                "1️⃣ -2%\n"
-                "2️⃣ -4%\n"
-                "3️⃣ -6%\n"
-                "4️⃣ -9%\n"
-                "5️⃣ -12%\n"
-                "6️⃣ -15%\n\n"
-                "🎯 Take Profit: +6%\n"
-                "📡 Precio: WebSocket"
-            )
-
-            print(mensaje)
-
-            enviar_telegram(
-                mensaje
-            )
+        if (
+            time.time()
+            - ultimo_error_binance
+            < 900
+        ):
 
             return
 
-        # ----------------------------------
-        # Mostrar precio
-        # ----------------------------------
-        print(
-            f"🔍 BTC: "
-            f"{precio_actual:.2f} | "
-            f"Referencia: "
-            f"{precio_referencia:.2f}"
+    # --------------------------------------
+    # Referencia inicial
+    # --------------------------------------
+    if precio_referencia is None:
+
+        precio_referencia = precio
+
+        guardar_estado()
+
+        enviar_telegram(
+            "🚀 BOT INICIADO\n"
+            f"BTC: {precio:.2f} USDT\n"
+            f"Referencia: {precio:.2f}\n\n"
+            "Niveles:\n"
+            "1️⃣ -2%\n"
+            "2️⃣ -4%\n"
+            "3️⃣ -6%\n"
+            "4️⃣ -9%\n"
+            "5️⃣ -12%\n"
+            "6️⃣ -15%\n\n"
+            "🎯 Take Profit: +6%\n"
+            "📡 Precio: WebSocket"
         )
 
-        # ----------------------------------
-        # Mostrar niveles
-        # ----------------------------------
-        for i, caida in enumerate(
-            PORCENTAJES_CAIDA
-        ):
+        return
 
-            precio_objetivo = (
-                precio_referencia
-                * (1 + caida)
-            )
+    # --------------------------------------
+    # Buscar nivel
+    # --------------------------------------
+    for i, caida in enumerate(
+        PORCENTAJES_CAIDA
+    ):
+
+        if niveles_activos[i]:
+            continue
+
+        if niveles_completados[i]:
+            continue
+
+        objetivo = (
+            precio_referencia
+            * (1 + caida)
+        )
+
+        if precio <= objetivo:
 
             print(
-                f"Nivel {i + 1}: "
-                f"{precio_objetivo:.2f} USDT"
+                f"🚨 NIVEL {i + 1} "
+                f"ALCANZADO\n"
+                f"Precio: {precio:.2f}\n"
+                f"Objetivo: {objetivo:.2f}"
             )
 
-        # ----------------------------------
-        # Niveles ocupados
-        # ----------------------------------
-        niveles_ocupados = [
-            i + 1
-            for i, activo
-            in niveles_activos.items()
-            if activo
-        ]
+            ejecutada = (
+                ejecutar_compra(
+                    i,
+                    precio
+                )
+            )
 
-        print(
-            "📊 Operaciones activas: "
-            f"{niveles_ocupados if niveles_ocupados else 'ninguna'}"
+            if ejecutada:
+
+                break
+
+    # --------------------------------------
+    # Nuevo ciclo
+    # --------------------------------------
+    if not any(
+        niveles_activos.values()
+    ):
+
+        precio_nuevo_ciclo = (
+            precio_referencia
+            * (
+                1
+                + TAKE_PROFIT_PORCENTAJE
+            )
         )
 
-        # ----------------------------------
-        # Buscar compra
-        # ----------------------------------
-        for i, caida in enumerate(
-            PORCENTAJES_CAIDA
-        ):
+        if precio >= precio_nuevo_ciclo:
 
-            if niveles_activos[i]:
-                continue
-
-            if niveles_completados[i]:
-                continue
-
-            precio_objetivo = (
+            anterior = (
                 precio_referencia
-                * (1 + caida)
             )
 
-            if (
-                precio_actual
-                <= precio_objetivo
-            ):
+            precio_referencia = precio
 
-                compra_realizada = (
-                    ejecutar_compra(
-                        i,
-                        precio_actual
-                    )
+            niveles_completados = {
+                i: False
+                for i in range(
+                    MAX_OPERACIONES
                 )
+            }
 
-                # Máximo una compra por evento
-                if compra_realizada:
-                    break
+            guardar_estado()
 
-        # ----------------------------------
-        # NUEVO CICLO ALCISTA
-        # ----------------------------------
-        if not any(
-            niveles_activos.values()
-        ):
-
-            precio_nuevo_ciclo = (
-                precio_referencia
-                * (
-                    1
-                    + TAKE_PROFIT_PORCENTAJE
-                )
+            enviar_telegram(
+                "🔄 NUEVO CICLO\n"
+                f"Referencia anterior: "
+                f"{anterior:.2f}\n"
+                f"Nueva referencia: "
+                f"{precio:.2f}"
             )
-
-            if (
-                precio_actual
-                >= precio_nuevo_ciclo
-            ):
-
-                precio_anterior = (
-                    precio_referencia
-                )
-
-                precio_referencia = (
-                    precio_actual
-                )
-
-                niveles_completados = {
-                    i: False
-                    for i in range(
-                        MAX_OPERACIONES
-                    )
-                }
-
-                guardar_estado()
-
-                enviar_telegram(
-                    "🔄 NUEVO CICLO\n"
-                    f"Referencia anterior: "
-                    f"{precio_anterior:.2f}\n"
-                    f"Nueva referencia: "
-                    f"{precio_referencia:.2f}"
-                )
-
-    except Exception as e:
-
-        print(
-            f"❌ Error evaluando estrategia: {e}"
-        )
-
-        manejar_error_binance(e)
 
 
 # ==========================================
-# 📡 WEBSOCKET - BINANCE
+# 📡 MARKET WEBSOCKET
 # ==========================================
-def websocket_on_message(ws, message):
+def market_on_message(
+    ws,
+    message
+):
 
-    global precio_actual_ws
-    global ws_ultimo_mensaje
+    global ultimo_precio_ws
 
     try:
 
-        data = json.loads(message)
+        data = json.loads(
+            message
+        )
 
-        # ----------------------------------
-        # Evento trade
-        # ----------------------------------
         if data.get("e") != "trade":
             return
 
@@ -1141,89 +873,87 @@ def websocket_on_message(ws, message):
         if precio is None:
             return
 
-        precio = float(precio)
+        precio = float(
+            precio
+        )
 
         with lock_precio:
 
-            precio_actual_ws = precio
-            ws_ultimo_mensaje = time.time()
+            ultimo_precio_ws = (
+                time.time()
+            )
 
-        # Evaluar estrategia en tiempo real
-        evaluar_estrategia(precio)
+        evaluar_estrategia(
+            precio
+        )
 
     except Exception as e:
 
         print(
-            f"❌ Error procesando WebSocket: {e}"
+            f"❌ Error market WS: {e}"
         )
 
 
-def websocket_on_error(ws, error):
+def market_on_open(ws):
+
+    global market_ws_conectado
+
+    market_ws_conectado = True
 
     print(
-        f"❌ WebSocket error: {error}"
-    )
-
-
-def websocket_on_close(
-    ws,
-    close_status_code,
-    close_msg
-):
-
-    global ws_conectado
-
-    ws_conectado = False
-
-    print(
-        "⚠️ WebSocket desconectado."
-    )
-
-    print(
-        f"Código: {close_status_code} | "
-        f"Mensaje: {close_msg}"
-    )
-
-
-def websocket_on_open(ws):
-
-    global ws_conectado
-
-    ws_conectado = True
-
-    print(
-        "✅ WebSocket Binance conectado."
+        "📡 WebSocket de mercado conectado."
     )
 
     enviar_telegram(
-        "📡 WebSocket Binance conectado.\n"
-        "Precio BTC en tiempo real."
+        "📡 WebSocket BTC conectado.\n"
+        "Precio en tiempo real."
     )
 
 
-# ==========================================
-# 🔁 HILO WEBSOCKET
-# ==========================================
-def ejecutar_websocket():
-
-    global ws_conectado
+def market_on_error(
+    ws,
+    error
+):
 
     print(
-        "📡 Hilo WebSocket iniciado."
+        f"❌ Market WS: {error}"
     )
+
+
+def market_on_close(
+    ws,
+    code,
+    message
+):
+
+    global market_ws_conectado
+
+    market_ws_conectado = False
+
+    print(
+        "⚠️ Market WebSocket cerrado."
+    )
+
+    print(
+        f"Código: {code} | "
+        f"{message}"
+    )
+
+
+def ejecutar_market_websocket():
 
     while True:
 
         try:
 
-            ws_conectado = False
-
-            socket = websocket.WebSocketApp(
-                WS_URL,
-                on_open=websocket_on_open,
-                on_message=websocket_on_message,
-                on_error=websocket_on_error,
-                on_close=websocket_on_close
+            socket = (
+                websocket.WebSocketApp(
+                    MARKET_WS_URL,
+                    on_open=market_on_open,
+                    on_message=market_on_message,
+                    on_error=market_on_error,
+                    on_close=market_on_close
+                )
             )
 
             socket.run_forever(
@@ -1233,62 +963,392 @@ def ejecutar_websocket():
 
         except Exception as e:
 
-            ws_conectado = False
-
             print(
-                f"❌ Error WebSocket: {e}"
+                f"❌ Market WS error: {e}"
             )
-
-        print(
-            "🔄 Reconectando WebSocket "
-            "en 5 segundos..."
-        )
 
         time.sleep(5)
 
 
 # ==========================================
-# 🔄 SINCRONIZACIÓN REST
+# 🔐 FIRMA HMAC
 # ==========================================
-def bucle_sincronizacion():
+def generar_firma(
+    params
+):
+
+    payload = (
+        urllib.parse.urlencode(
+            params
+        )
+    )
+
+    firma = hmac.new(
+        BINANCE_SECRET_KEY.encode(
+            "utf-8"
+        ),
+        payload.encode(
+            "utf-8"
+        ),
+        hashlib.sha256
+    ).hexdigest()
+
+    return firma
+
+
+# ==========================================
+# 👤 USER DATA WEBSOCKET
+# ==========================================
+def usuario_ws_message(
+    ws,
+    message
+):
+
+    global user_ws_conectado
+
+    try:
+
+        data = json.loads(
+            message
+        )
+
+        # ----------------------------------
+        # Respuesta de suscripción
+        # ----------------------------------
+        if (
+            "status" in data
+            and "result" in data
+        ):
+
+            if data.get("status") == 200:
+
+                print(
+                    "✅ User Data Stream "
+                    "suscrito."
+                )
+
+            return
+
+        # ----------------------------------
+        # Evento de cuenta
+        # ----------------------------------
+        evento = data.get(
+            "event",
+            {}
+        )
+
+        event_type = evento.get(
+            "e"
+        )
+
+        if event_type == "executionReport":
+
+            procesar_execution_report(
+                evento
+            )
+
+    except Exception as e:
+
+        print(
+            f"❌ Error User WS: {e}"
+        )
+
+
+def procesar_execution_report(
+    evento
+):
+
+    global niveles_activos
+    global niveles_completados
+
+    symbol = evento.get(
+        "s"
+    )
+
+    if symbol != BINANCE_SYMBOL:
+        return
+
+    order_status = evento.get(
+        "X"
+    )
+
+    side = evento.get(
+        "S"
+    )
+
+    client_id = evento.get(
+        "c",
+        ""
+    )
+
+    order_id = evento.get(
+        "i"
+    )
+
+    # --------------------------------------
+    # TP SELL ejecutado
+    # --------------------------------------
+    if (
+        side == "SELL"
+        and client_id.startswith(
+            "BOT_TP_"
+        )
+        and order_status == "FILLED"
+    ):
+
+        partes = client_id.split(
+            "_"
+        )
+
+        if len(partes) >= 3:
+
+            try:
+
+                nivel = int(
+                    partes[2]
+                )
+
+                if (
+                    0 <= nivel
+                    < MAX_OPERACIONES
+                ):
+
+                    niveles_activos[
+                        nivel
+                    ] = False
+
+                    niveles_completados[
+                        nivel
+                    ] = True
+
+                    ordenes_tp.pop(
+                        nivel,
+                        None
+                    )
+
+                    guardar_estado()
+
+                    enviar_telegram(
+                        "💰 TAKE PROFIT EJECUTADO\n"
+                        f"Nivel: {nivel + 1}\n"
+                        f"Orden: {order_id}\n"
+                        "Objetivo: +6%"
+                    )
+
+                    print(
+                        f"🎯 TP ejecutado "
+                        f"nivel {nivel + 1}"
+                    )
+
+            except ValueError:
+
+                pass
+
+
+# ==========================================
+# USER WS OPEN
+# ==========================================
+def usuario_ws_open(
+    ws
+):
+
+    global user_ws_conectado
+
+    user_ws_conectado = True
 
     print(
-        "🔄 Hilo de sincronización iniciado."
+        "🔐 User WebSocket conectado."
     )
+
+    # --------------------------------------
+    # Parámetros firmados
+    # --------------------------------------
+    params = {
+        "apiKey": BINANCE_API_KEY,
+        "timestamp": int(
+            time.time() * 1000
+        ),
+        "recvWindow": 5000
+    }
+
+    firma = generar_firma(
+        params
+    )
+
+    params[
+        "signature"
+    ] = firma
+
+    request = {
+        "id": str(
+            uuid.uuid4()
+        ),
+        "method":
+            "userDataStream.subscribe.signature",
+        "params": params
+    }
+
+    ws.send(
+        json.dumps(
+            request
+        )
+    )
+
+    print(
+        "🔐 Suscripción User Data "
+        "enviada."
+    )
+
+
+def usuario_ws_error(
+    ws,
+    error
+):
+
+    print(
+        f"❌ User WS error: {error}"
+    )
+
+
+def usuario_ws_close(
+    ws,
+    code,
+    message
+):
+
+    global user_ws_conectado
+
+    user_ws_conectado = False
+
+    print(
+        "⚠️ User WebSocket cerrado."
+    )
+
+    print(
+        f"Código: {code} | "
+        f"{message}"
+    )
+
+
+# ==========================================
+# 🔁 EJECUTAR USER WEBSOCKET
+# ==========================================
+def ejecutar_user_websocket():
 
     while True:
 
         try:
 
-            sincronizar_estado()
+            socket = (
+                websocket.WebSocketApp(
+                    USER_WS_URL,
+                    on_open=usuario_ws_open,
+                    on_message=usuario_ws_message,
+                    on_error=usuario_ws_error,
+                    on_close=usuario_ws_close
+                )
+            )
+
+            socket.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
 
         except Exception as e:
 
             print(
-                f"❌ Error sincronización: {e}"
+                f"❌ User WS exception: {e}"
             )
 
-        time.sleep(
-            INTERVALO_SINCRONIZACION_SEGUNDOS
-        )
+        time.sleep(10)
 
 
 # ==========================================
-# 🚀 ARRANQUE RENDER
+# 📊 ESTADO CONSOLA
+# ==========================================
+def monitor_estado():
+
+    while True:
+
+        try:
+
+            with lock_precio:
+
+                precio = precio_actual
+
+            niveles = [
+                i + 1
+                for i, activo
+                in niveles_activos.items()
+                if activo
+            ]
+
+            print(
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+
+            print(
+                f"₿ BTC: "
+                f"{precio if precio else 0:.2f}"
+            )
+
+            print(
+                f"📌 Referencia: "
+                f"{precio_referencia if precio_referencia else 0:.2f}"
+            )
+
+            print(
+                "📊 Operaciones activas: "
+                f"{niveles if niveles else 'ninguna'}"
+            )
+
+            print(
+                f"📡 Market WS: "
+                f"{market_ws_conectado}"
+            )
+
+            print(
+                f"🔐 User WS: "
+                f"{user_ws_conectado}"
+            )
+
+            print(
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Monitor: {e}"
+            )
+
+        time.sleep(60)
+
+
+# ==========================================
+# 🚀 ARRANQUE
 # ==========================================
 if __name__ == "__main__":
 
     print(
-        "🚀 Iniciando bot..."
+        "🚀 INICIANDO BOT BITCOIN V2"
     )
 
     # --------------------------------------
-    # Cargar estado
+    # Validar variables
     # --------------------------------------
-    cargar_estado()
+    if not BINANCE_API_KEY:
+        print(
+            "❌ Falta BINANCE_API_KEY"
+        )
+
+    if not BINANCE_SECRET_KEY:
+        print(
+            "❌ Falta BINANCE_SECRET_KEY"
+        )
 
     # --------------------------------------
-    # Cargar mercados CCXT una sola vez
+    # Cargar mercados
     # --------------------------------------
     try:
 
@@ -1306,37 +1366,53 @@ if __name__ == "__main__":
         )
 
     # --------------------------------------
-    # Hilo WebSocket
+    # Cargar estado
     # --------------------------------------
-    hilo_websocket = threading.Thread(
-        target=ejecutar_websocket,
+    cargar_estado()
+
+    # --------------------------------------
+    # Market WebSocket
+    # --------------------------------------
+    hilo_market = threading.Thread(
+        target=ejecutar_market_websocket,
         daemon=True
     )
 
-    hilo_websocket.start()
+    hilo_market.start()
 
     # --------------------------------------
-    # Hilo sincronización REST
+    # User WebSocket
     # --------------------------------------
-    hilo_sincronizacion = threading.Thread(
-        target=bucle_sincronizacion,
+    hilo_user = threading.Thread(
+        target=ejecutar_user_websocket,
         daemon=True
     )
 
-    hilo_sincronizacion.start()
+    hilo_user.start()
+
+    # --------------------------------------
+    # Monitor
+    # --------------------------------------
+    hilo_monitor = threading.Thread(
+        target=monitor_estado,
+        daemon=True
+    )
+
+    hilo_monitor.start()
 
     # --------------------------------------
     # Telegram
     # --------------------------------------
     enviar_telegram(
-        "🟢 Bot de Binance iniciado.\n"
-        "📡 WebSocket activo.\n"
-        "🎯 TP: +6%\n"
-        "💵 Compras: 6 x 10 USDT"
+        "🟢 BOT BITCOIN V2 INICIADO\n\n"
+        "📡 Market WebSocket: activo\n"
+        "🔐 User Data WebSocket: activo\n"
+        "💵 Compras: 6 × 10 USDT\n"
+        "🎯 Take Profit: +6%"
     )
 
     # --------------------------------------
-    # Render / FastAPI
+    # FastAPI / Render
     # --------------------------------------
     import uvicorn
 
